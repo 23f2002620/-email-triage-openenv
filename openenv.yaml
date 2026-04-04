@@ -1,0 +1,96 @@
+name: email-triage-env
+version: "1.0.0"
+description: >
+  A real-world email triage environment where an AI agent must read, classify,
+  prioritize, and respond to emails. Simulates a customer support inbox with
+  urgent escalations, routine requests, and spam filtering tasks.
+author: openenv-submission
+tags:
+  - openenv
+  - email
+  - triage
+  - customer-support
+  - nlp
+
+tasks:
+  - id: email_classify
+    name: Email Classification
+    description: >
+      Classify incoming emails into categories: urgent, normal, spam.
+      Agent receives a single email and must output the correct category label.
+    difficulty: easy
+    max_steps: 5
+    reward_range: [0.0, 1.0]
+
+  - id: email_prioritize
+    name: Email Prioritization Queue
+    description: >
+      Given a mixed inbox of 5 emails, sort them by priority (1=highest).
+      Agent must correctly rank-order urgent > normal > spam emails.
+      Multiple submissions allowed within max_steps; feedback is given after
+      each attempt so the agent can refine its ordering.
+    difficulty: medium
+    max_steps: 10
+    reward_range: [0.0, 1.0]
+
+  - id: email_respond
+    name: Email Response Drafting
+    description: >
+      Draft an appropriate response to a customer support email. Agent must
+      address the customer's issue, maintain professional tone, and include
+      required fields (greeting, issue acknowledgment, resolution, sign-off).
+      Three distinct complaint scenarios available (billing, wrong item, account lock).
+    difficulty: hard
+    max_steps: 15
+    reward_range: [0.0, 1.0]
+
+observation_space:
+  type: object
+  description: >
+    Contains the current email(s) to process, inbox state, step count,
+    and previous action results.
+  fields:
+    - name: goal
+      type: string
+      description: The task objective for this episode
+    - name: emails
+      type: list
+      description: List of email objects with id, subject, body, sender, timestamp
+    - name: inbox_state
+      type: object
+      description: Current state of the inbox (categorized, prioritized, attempts, etc.)
+    - name: step
+      type: integer
+      description: Current step number
+    - name: last_action_result
+      type: string
+      description: Human-readable result/feedback from the last action taken
+    - name: last_action_error
+      type: boolean
+      description: True if the last action produced a validation error
+    - name: done
+      type: boolean
+      description: True if the episode has ended (max steps reached or task complete)
+
+action_space:
+  type: object
+  description: >
+    Structured actions the agent can take on emails.
+  actions:
+    - name: classify_email
+      args: [email_id, category]
+      description: Classify email_id as urgent/normal/spam
+    - name: prioritize_inbox
+      args: [ordered_ids]
+      description: Submit a priority-ordered list of email IDs (highest priority first)
+    - name: draft_response
+      args: [email_id, response_text]
+      description: Draft a full professional response to the specified email
+    - name: noop
+      args: []
+      description: Take no action (step is consumed)
+
+endpoint:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
