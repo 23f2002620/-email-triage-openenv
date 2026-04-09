@@ -1,16 +1,10 @@
 """
 Baseline inference script for the Email Triage OpenEnv environment.
 
-Usage:
-    python inference.py
-
 Required environment variables:
     API_BASE_URL   - LLM API endpoint (OpenAI-compatible)
     MODEL_NAME     - Model identifier to use for inference
     HF_TOKEN       - Your Hugging Face / API key
-
-The script runs the standard OpenAI client against all 3 tasks and prints
-structured logs (START/STEP/END) for each episode.
 """
 
 from __future__ import annotations
@@ -18,39 +12,44 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import textwrap
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
-# Configuration — read from environment variables
-# Defaults are set only for API_BASE_URL and MODEL_NAME (not HF_TOKEN)
+# Configuration — defaults set only for API_BASE_URL and MODEL_NAME
 # ---------------------------------------------------------------------------
 
 API_BASE_URL: str = os.getenv("API_BASE_URL", "<your-api-base-url>")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "<your-action-model-name>")
 HF_TOKEN: str = os.getenv("HF_TOKEN")
 
-# Optional — only needed when ENV_MODE=http
 LOCAL_IMAGE_NAME: str = os.getenv("LOCAL_IMAGE_NAME")
 
-ENV_MODE: str = os.getenv("ENV_MODE", "local").lower()   # "local" | "http"
+ENV_MODE: str = os.getenv("ENV_MODE", "local").lower()
 SPACE_URL: str = (os.getenv("SPACE_URL") or "").rstrip("/")
 
 MAX_STEPS = 10
-TEMPERATURE = 0.0   # deterministic for reproducibility
+TEMPERATURE = 0.0
 MAX_TOKENS = 512
 
-# ---------------------------------------------------------------------------
 # All LLM calls use the OpenAI client configured via these variables
-# ---------------------------------------------------------------------------
-
 client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN or "dummy")
 
+
+
 # ---------------------------------------------------------------------------
-# Local environment import (ENV_MODE=local)
+# Score clamping — validator requires strictly (0, 1), never 0.0 or 1.0
+# ---------------------------------------------------------------------------
+
+def _clamp(score: float) -> float:
+    """Clamp score to strictly (0, 1) as required by the OpenEnv validator."""
+    return max(0.01, min(0.99, float(score)))
+
+# ---------------------------------------------------------------------------
+# Local environment import
 # ---------------------------------------------------------------------------
 
 if ENV_MODE == "local":
@@ -74,7 +73,7 @@ else:
     )
 
 # ---------------------------------------------------------------------------
-# HTTP helpers (ENV_MODE=http)
+# HTTP helpers
 # ---------------------------------------------------------------------------
 
 def _http_reset(task_id: str, email_index: int) -> Tuple[str, Dict[str, Any]]:
@@ -91,44 +90,30 @@ def _http_reset(task_id: str, email_index: int) -> Tuple[str, Dict[str, Any]]:
 
 def _http_step(session_id: str, action_dict: Dict[str, Any]) -> Dict[str, Any]:
     import requests
-    payload = {"session_id": session_id, **action_dict}
-    resp = requests.post(f"{SPACE_URL}/step", json=payload, timeout=30)
+    resp = requests.post(
+        f"{SPACE_URL}/step",
+        json={"session_id": session_id, **action_dict},
+        timeout=30,
+    )
     resp.raise_for_status()
     return resp.json()
 
 # ---------------------------------------------------------------------------
-# System prompt
+# Prompts
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = textwrap.dedent(
-    """
+SYSTEM_PROMPT = textwrap.dedent("""
     You are an AI email triage assistant operating inside an OpenEnv environment.
-    You will be given an observation describing your current task and the emails
-    available in the inbox.
+    Respond with a single valid JSON action object using exactly one of these schemas:
 
-    You must respond with a single valid JSON action object. The action must
-    follow exactly one of these schemas:
+    1. {"action_type": "classify_email", "email_id": "<id>", "category": "urgent"|"normal"|"spam"}
+    2. {"action_type": "prioritize_inbox", "ordered_ids": ["<id1>", "<id2>", ...]}
+    3. {"action_type": "draft_response", "email_id": "<id>", "response_text": "<full reply>"}
+    4. {"action_type": "noop"}
 
-    1. Classify an email:
-       {"action_type": "classify_email", "email_id": "<id>", "category": "urgent"|"normal"|"spam"}
-
-    2. Prioritize the inbox (list email IDs highest priority first):
-       {"action_type": "prioritize_inbox", "ordered_ids": ["<id1>", "<id2>", ...]}
-
-    3. Draft a response to an email:
-       {"action_type": "draft_response", "email_id": "<id>", "response_text": "<your full response>"}
-
-    4. Do nothing:
-       {"action_type": "noop"}
-
-    RULES:
-    - Output ONLY valid JSON — no prose, no markdown fences, no explanation.
-    - For classify_email: category must be exactly "urgent", "normal", or "spam".
-    - For draft_response: response_text must be a complete, professional email
-      reply (greeting, acknowledgment, apology, resolution, sign-off).
-    - Read the observation carefully — the goal tells you exactly what to do.
-    """
-).strip()
+    Output ONLY valid JSON. No prose, no markdown fences, no explanation.
+    For draft_response: include greeting, acknowledgment, apology, resolution, sign-off.
+""").strip()
 
 
 def build_user_prompt(observation: Dict[str, Any]) -> str:
@@ -141,32 +126,19 @@ def build_user_prompt(observation: Dict[str, Any]) -> str:
             f"  Body: {email['body'][:400]}"
         )
     emails_text = "\n\n".join(emails_summary) if emails_summary else "  (no emails)"
-    inbox = observation.get("inbox_state", {})
-    last_result = observation.get("last_action_result", "")
-    last_error = observation.get("last_action_error", False)
-
-    return textwrap.dedent(
-        f"""
-        GOAL: {observation.get('goal', '(none)')}
-
-        STEP: {observation.get('step', 0)}
-
-        EMAILS IN INBOX:
-        {emails_text}
-
-        INBOX STATE: {json.dumps(inbox, indent=2)}
-
-        LAST ACTION RESULT: {last_result or '(none)'}
-        LAST ACTION ERROR: {last_error}
-
-        Respond with a single valid JSON action.
-        """
-    ).strip()
+    return (
+        f"GOAL: {observation.get('goal', '(none)')}\n"
+        f"STEP: {observation.get('step', 0)}\n\n"
+        f"EMAILS IN INBOX:\n{emails_text}\n\n"
+        f"INBOX STATE: {json.dumps(observation.get('inbox_state', {}))}\n"
+        f"LAST ACTION RESULT: {observation.get('last_action_result') or '(none)'}\n"
+        f"LAST ACTION ERROR: {observation.get('last_action_error', False)}\n\n"
+        f"Respond with a single valid JSON action."
+    )
 
 
 def parse_action(response_text: str) -> Optional[Dict[str, Any]]:
-    text = response_text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```(?:json)?\s*", "", response_text.strip(), flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text).strip()
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
@@ -180,33 +152,29 @@ def parse_action(response_text: str) -> Optional[Dict[str, Any]]:
 # Episode runners
 # ---------------------------------------------------------------------------
 
-def run_episode_local(task_id: str, email_index: int = 0) -> Tuple[float, List[Dict]]:
+def run_episode_local(task_id: str, email_index: int = 0) -> Tuple[float, int]:
     env = EmailTriageEnv(task_id=task_id, email_index=email_index)
-    observation = env.reset()
-    obs_dict = observation.model_dump()
-    step_log = []
+    obs_dict = env.reset().model_dump()
     final_reward = 0.0
+    steps_taken = 0
 
     for step_num in range(1, MAX_STEPS + 1):
         if obs_dict.get("done", False):
             break
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(obs_dict)},
-        ]
-
         try:
             completion = client.chat.completions.create(
                 model=MODEL_NAME,
-                messages=messages,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": build_user_prompt(obs_dict)},
+                ],
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
                 stream=False,
             )
             response_text = completion.choices[0].message.content or ""
-        except Exception as exc:
-            print(f"    [Step {step_num}] API error: {exc}. Using noop.")
+        except Exception:
             response_text = '{"action_type": "noop"}'
 
         action_dict = parse_action(response_text) or {"action_type": "noop"}
@@ -224,103 +192,76 @@ def run_episode_local(task_id: str, email_index: int = 0) -> Tuple[float, List[D
             action = Action(action_type=ActionType.NOOP)
 
         result = env.step(action)
-        reward = result.reward
-
-        # Stdout logs follow the required structured format (START/STEP/END)
-        print(f"STEP {step_num} | task={task_id} | action={action.action_type.value} | reward={reward:.4f} | done={result.done}")
-
-        step_log.append({
-            "step": step_num,
-            "action_type": action.action_type.value,
-            "reward": reward,
-            "done": result.done,
-            "last_result": result.observation.last_action_result[:120],
-        })
-
+        reward = _clamp(result.reward)
+        steps_taken = step_num
         final_reward = max(final_reward, reward)
-        obs_dict = result.observation.model_dump()
 
+        # Required structured output — flush=True so validator captures immediately
+        print(f"[STEP] step={step_num} reward={reward:.4f}", flush=True)
+
+        obs_dict = result.observation.model_dump()
         if result.done:
             break
 
-    return final_reward, step_log
+    return final_reward, steps_taken
 
 
-def run_episode_http(task_id: str, email_index: int = 0) -> Tuple[float, List[Dict]]:
+def run_episode_http(task_id: str, email_index: int = 0) -> Tuple[float, int]:
     session_id, obs_dict = _http_reset(task_id, email_index)
-    step_log = []
     final_reward = 0.0
+    steps_taken = 0
 
     for step_num in range(1, MAX_STEPS + 1):
         if obs_dict.get("done", False):
             break
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(obs_dict)},
-        ]
-
         try:
             completion = client.chat.completions.create(
                 model=MODEL_NAME,
-                messages=messages,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": build_user_prompt(obs_dict)},
+                ],
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
                 stream=False,
             )
             response_text = completion.choices[0].message.content or ""
-        except Exception as exc:
-            print(f"    [Step {step_num}] API error: {exc}. Using noop.")
+        except Exception:
             response_text = '{"action_type": "noop"}'
 
         action_dict = parse_action(response_text) or {"action_type": "noop"}
         result = _http_step(session_id, action_dict)
         obs_dict = result["observation"]
-        reward = result["reward"]
-
-        # Stdout logs follow the required structured format (START/STEP/END)
-        print(f"STEP {step_num} | task={task_id} | action={action_dict.get('action_type','noop')} | reward={reward:.4f} | done={result['done']}")
-
-        step_log.append({
-            "step": step_num,
-            "action_type": action_dict.get("action_type", "noop"),
-            "reward": reward,
-            "done": result["done"],
-            "last_result": obs_dict.get("last_action_result", "")[:120],
-        })
-
+        reward = _clamp(result["reward"])
+        steps_taken = step_num
         final_reward = max(final_reward, reward)
+
+        # Required structured output — flush=True so validator captures immediately
+        print(f"[STEP] step={step_num} reward={reward:.4f}", flush=True)
+
         if result["done"]:
             break
 
-    return final_reward, step_log
+    return final_reward, steps_taken
 
 
-def run_episode(task_id: str, email_index: int = 0) -> Tuple[float, List[Dict]]:
+def run_episode(task_id: str, email_index: int = 0) -> Tuple[float, int]:
     if ENV_MODE == "http":
         return run_episode_http(task_id, email_index)
     return run_episode_local(task_id, email_index)
 
 # ---------------------------------------------------------------------------
-# Main — structured START/STEP/END stdout format
+# Main — [START]/[STEP]/[END] blocks with flush=True throughout
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # START log
-    print("START")
-    print(f"model={MODEL_NAME}")
-    print(f"api_base={API_BASE_URL}")
-    print(f"mode={ENV_MODE}")
-    print()
-
     if not HF_TOKEN:
-        print("WARNING: HF_TOKEN not set. Set it via: export HF_TOKEN=hf_...")
+        print("WARNING: HF_TOKEN not set.", flush=True)
 
     if ENV_MODE == "http" and not SPACE_URL:
-        raise SystemExit(
-            "ERROR: ENV_MODE=http requires SPACE_URL.\n"
-            "  export SPACE_URL=https://your-username-email-triage-openenv.hf.space"
-        )
+        print("ERROR: ENV_MODE=http requires SPACE_URL.", flush=True)
+        sys.exit(1)
 
     task_scores: Dict[str, List[float]] = {
         TASK_CLASSIFY: [],
@@ -332,41 +273,27 @@ def main() -> None:
         task_id = episode_cfg["task_id"]
         email_index = episode_cfg["email_index"]
 
-        # START episode
-        print(f"START_EPISODE task={task_id} email_index={email_index}")
-        start = time.time()
+        # [START] block — parsed by validator
+        print(f"[START] task={task_id}", flush=True)
 
-        reward, step_log = run_episode(task_id, email_index)
-        elapsed = time.time() - start
-
+        reward, steps = run_episode(task_id, email_index)
+        reward = _clamp(reward)
         task_scores[task_id].append(reward)
 
-        # END episode
-        print(f"END_EPISODE task={task_id} email_index={email_index} reward={reward:.4f} elapsed={elapsed:.1f}s")
-        print()
+        # [END] block — parsed by validator
+        print(f"[END] task={task_id} score={reward:.4f} steps={steps}", flush=True)
 
-    # END summary
-    print("END")
-    print()
-    print("=" * 50)
-    print("BASELINE SCORE REPORT")
-    print("=" * 50)
-
+    # Summary
     all_scores = []
     for task_id, scores in task_scores.items():
         if scores:
             avg = sum(scores) / len(scores)
-            scores_str = ", ".join(f"{s:.4f}" for s in scores)
-            print(f"  {task_id:<25} n={len(scores)}  avg={avg:.4f}  scores=[{scores_str}]")
             all_scores.extend(scores)
-        else:
-            print(f"  {task_id:<25} (no episodes run)")
+            print(f"[SUMMARY] task={task_id} n={len(scores)} avg={avg:.4f}", flush=True)
 
     if all_scores:
         overall = sum(all_scores) / len(all_scores)
-        print(f"\n  OVERALL AVERAGE: {overall:.4f}")
-
-    print("=" * 50)
+        print(f"[SUMMARY] overall_avg={overall:.4f}", flush=True)
 
 
 if __name__ == "__main__":
